@@ -9,7 +9,17 @@ from ruamel import yaml as yaml
 from ruamel.yaml import YAMLError
 from ruamel.yaml.constructor import DuplicateKeyError
 
-from typing import AbstractSet, Any, Dict, List, Text, Optional, Coroutine, Union
+from typing import (
+    AbstractSet,
+    Any,
+    ClassVar,
+    Dict,
+    List,
+    Text,
+    Optional,
+    Coroutine,
+    Union,
+)
 
 import rasa_sdk
 
@@ -32,9 +42,18 @@ logger = logging.getLogger(__name__)
 
 
 class Element(dict):
-    __acceptable_keys = ["title", "item_url", "image_url", "subtitle", "buttons"]
+    """Represents an element in a list of elements in a rich message."""
+
+    __acceptable_keys: ClassVar[List[Text]] = [
+        "title",
+        "item_url",
+        "image_url",
+        "subtitle",
+        "buttons",
+    ]
 
     def __init__(self, *args, **kwargs):
+        """Initializes an element in a list of elements in a rich message."""
         kwargs = {
             key: value for key, value in kwargs.items() if key in self.__acceptable_keys
         }
@@ -43,13 +62,15 @@ class Element(dict):
 
 
 class Button(dict):
+    """Represents a button in a rich message."""
+
     pass
 
 
 class Singleton(type):
     """Singleton metaclass."""
 
-    _instances: Dict[Any, Any] = {}
+    _instances: ClassVar[Dict[Any, Any]] = {}
 
     def __call__(cls, *args: Any, **kwargs: Any) -> Any:
         """Call the class.
@@ -63,6 +84,7 @@ class Singleton(type):
 
         return cls._instances[cls]
 
+    @classmethod
     def clear(cls) -> None:
         """Clear the class."""
         cls._instances = {}
@@ -257,12 +279,12 @@ def check_version_compatibility(rasa_version: Optional[Text]) -> None:
     rasa and rasa_sdk.
 
     Args:
-        rasa_version - A string containing the version of rasa that
-        is making the call to the action server.
+        rasa_version: A string containing the version of rasa that
+                        is making the call to the action server.
 
     Raises:
-        Warning - The version of rasa version unknown or not compatible with
-        this version of rasa_sdk.
+        Warning: The version of rasa version unknown or not compatible with
+                    this version of rasa_sdk.
     """
     # Check for versions of Rasa that are too old to report their version number
     if rasa_version is None:
@@ -314,7 +336,7 @@ def update_sanic_log_level() -> None:
 
 
 async def call_potential_coroutine(
-    coroutine_or_return_value: Union[Any, Coroutine]
+    coroutine_or_return_value: Union[Any, Coroutine],
 ) -> Any:
     """Await if it's a coroutine."""
     if asyncio.iscoroutine(coroutine_or_return_value):
@@ -386,3 +408,24 @@ def read_yaml_file(filename: Union[Text, Path]) -> Dict[Text, Any]:
         return read_yaml(read_file(filename, DEFAULT_ENCODING))
     except (YAMLError, DuplicateKeyError) as e:
         raise YamlSyntaxException(filename, e)
+
+
+def file_as_bytes(file_path: Text) -> bytes:
+    """Read in a file as a byte array.
+
+    Args:
+        file_path: Path to the file to read.
+
+    Returns:
+        The file content as a byte array.
+
+    Raises:
+        FileNotFoundException: If the file does not exist.
+    """
+    try:
+        with open(file_path, "rb") as f:
+            return f.read()
+    except FileNotFoundError:
+        raise FileNotFoundException(
+            f"Failed to read file, " f"'{os.path.abspath(file_path)}' does not exist."
+        )

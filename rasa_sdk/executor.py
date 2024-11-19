@@ -1,8 +1,8 @@
+from __future__ import annotations
 import importlib
 import inspect
 import logging
 import pkgutil
-import typing
 import warnings
 from typing import Text, List, Dict, Any, Type, Union, Callable, Optional, Set, cast
 from collections import namedtuple
@@ -10,21 +10,25 @@ import types
 import sys
 import os
 
-from rasa_sdk.interfaces import Tracker, ActionNotFoundException, Action
+from pydantic import BaseModel, Field
+
+from rasa_sdk.interfaces import (
+    Tracker,
+    ActionNotFoundException,
+    Action,
+    ActionMissingDomainException,
+)
 
 from rasa_sdk import utils
-
-if typing.TYPE_CHECKING:  # pragma: no cover
-    from rasa_sdk.types import ActionCall
 
 logger = logging.getLogger(__name__)
 
 
 class CollectingDispatcher:
-    """Send messages back to user"""
+    """Send messages back to user."""
 
     def __init__(self) -> None:
-
+        """Create a `CollectingDispatcher` object."""
         self.messages: List[Dict[Text, Any]] = []
 
     def utter_message(
@@ -63,6 +67,15 @@ class CollectingDispatcher:
 
     # deprecated
     def utter_custom_message(self, *elements: Dict[Text, Any], **kwargs: Any) -> None:
+        """Sends a message with custom elements to the output channel.
+
+        Deprecated:
+            Use `utter_message(elements=<list of elements>)` instead.
+
+        Args:
+            elements: List of elements to be sent to the output channel.
+            kwargs: Additional parameters to be sent to the output channel.
+        """
         warnings.warn(
             "Use of `utter_custom_message` is deprecated. "
             "Use `utter_message(elements=<list of elements>)` instead.",
@@ -157,13 +170,31 @@ class CollectingDispatcher:
 TimestampModule = namedtuple("TimestampModule", ["timestamp", "module"])
 
 
+class ActionExecutorRunResult(BaseModel):
+    """Model for action executor run result."""
+
+    events: List[Dict[Text, Any]] = Field(alias="events")
+    responses: List[Dict[Text, Any]] = Field(alias="responses")
+
+
 class ActionExecutor:
+    """Executes actions."""
+
     def __init__(self) -> None:
+        """Initializes the `ActionExecutor`."""
         self.actions: Dict[Text, Callable] = {}
         self._modules: Dict[Text, TimestampModule] = {}
         self._loaded: Set[Type[Action]] = set()
+        self.domain: Optional[Dict[Text, Any]] = None
+        self.domain_digest: Optional[Text] = None
 
     def register_action(self, action: Union[Type[Action], Action]) -> None:
+        """Register an action with the executor.
+
+        Args:
+            action: Action to be registered. It can either be an instance of
+            `Action` subclass class or an actual `Action` subclass.
+        """
         if inspect.isclass(action):
             action = cast(Type[Action], action)
             if action.__module__.startswith("rasa."):
@@ -187,7 +218,13 @@ class ActionExecutor:
                 "a function, use `register_function` instead."
             )
 
-    def register_function(self, name: Text, f: Callable) -> None:
+    def register_function(self, action_name: Text, f: Callable) -> None:
+        """Register an executor function for an action.
+
+        Args:
+            action_name: Name of the action.
+            f: Function to be registered.
+        """
         valid_keys = utils.arguments_of(f)
         if len(valid_keys) < 3:
             raise Exception(
@@ -198,12 +235,12 @@ class ActionExecutor:
                 "parameters."
             )
 
-        if name in self.actions:
-            logger.info(f"Re-registered function for '{name}'.")
+        if action_name in self.actions:
+            logger.info(f"Re-registered function for '{action_name}'.")
         else:
-            logger.info(f"Registered function for '{name}'.")
+            logger.info(f"Registered function for '{action_name}'.")
 
-        self.actions[name] = f
+        self.actions[action_name] = f
 
     def _import_submodules(
         self, package: Union[Text, types.ModuleType], recursive: bool = True
@@ -250,8 +287,7 @@ class ActionExecutor:
         return module
 
     def register_package(self, package: Union[Text, types.ModuleType]) -> None:
-        """Register all the `Action` subclasses contained in a Python module or
-        package.
+        """Register all the `Action` subclasses contained in a Python module or package.
 
         If an `ImportError` is raised when loading the module or package, the
         action server is stopped with exit code 1.
@@ -284,14 +320,14 @@ class ActionExecutor:
                 self.register_action(action)
 
     def _find_modules_to_reload(self) -> Dict[Text, TimestampModule]:
-        """Finds all Python modules that should be reloaded by checking their
-        files' timestamps.
+        """Finds all Python modules that should be reloaded.
+
+         Reloads modules by checking their files' timestamps.
 
         Returns:
             Dictionary containing file paths, new timestamps and Python modules
             that should be reloaded.
         """
-
         to_reload = {}
 
         for path, (timestamp, module) in self._modules.items():
@@ -343,11 +379,24 @@ class ActionExecutor:
     @staticmethod
     def _create_api_response(
         events: List[Dict[Text, Any]], messages: List[Dict[Text, Any]]
-    ) -> Dict[Text, Any]:
-        return {"events": events, "responses": messages}
+    ) -> ActionExecutorRunResult:
+        return ActionExecutorRunResult(events=events, responses=messages)
 
     @staticmethod
-    def validate_events(events: List[Dict[Text, Any]], action_name: Text):
+    def validate_events(
+        events: List[Dict[Text, Any]],
+        action_name: Text,
+    ) -> List[Dict[Text, Any]]:
+        """Validate the events returned by the action.
+
+        Args:
+            events: List of events returned by the action.
+
+            action_name: Name of the action that should be executed.
+
+        Returns:
+            List of validated events.
+        """
         validated = []
         for event in events:
             if isinstance(event, dict):
@@ -380,7 +429,68 @@ class ActionExecutor:
                 # we won't append this to validated events -> will be ignored
         return validated
 
-    async def run(self, action_call: "ActionCall") -> Optional[Dict[Text, Any]]:
+    def is_domain_digest_valid(self, domain_digest: Optional[Text]) -> bool:
+        """Check if the domain_digest is valid.
+
+        If the domain_digest is empty or different from the one provided, it is invalid.
+
+        Args:
+            domain_digest: latest value provided to compare the current value with.
+
+        Returns:
+            True if the domain_digest is valid, False otherwise.
+        """
+        return bool(self.domain_digest) and self.domain_digest == domain_digest
+
+    def update_and_return_domain(
+        self, payload: Dict[Text, Any], action_name: Text
+    ) -> Optional[Dict[Text, Any]]:
+        """Validate the digest, store the domain if available, and return the domain.
+
+        This method validates the domain digest from the payload.
+        If the digest is invalid and no domain is provided, an exception is raised.
+        If domain data is available, it stores the domain and digest.
+        Finally, it returns the domain.
+
+        Args:
+            payload: Request payload containing the domain data.
+            action_name: Name of the action that should be executed.
+
+        Returns:
+            The domain dictionary.
+
+        Raises:
+            ActionMissingDomainException: Invalid digest and no domain data available.
+        """
+        payload_domain = payload.get("domain")
+        payload_domain_digest = payload.get("domain_digest")
+
+        # If digest is invalid and no domain is available - raise the error
+        if (
+            not self.is_domain_digest_valid(payload_domain_digest)
+            and payload_domain is None
+        ):
+            raise ActionMissingDomainException(action_name)
+
+        if payload_domain:
+            self.domain = payload_domain
+            self.domain_digest = payload_domain_digest
+
+        return self.domain
+
+    async def run(
+        self,
+        action_call: Dict[Text, Any],
+    ) -> Optional[ActionExecutorRunResult]:
+        """Run the action and return the response.
+
+        Args:
+            action_call: Request payload containing the action data.
+
+        Returns:
+            Response containing the events and messages or None if
+            the action does not exist.
+        """
         from rasa_sdk.interfaces import Tracker
 
         action_name = action_call.get("next_action")
@@ -391,7 +501,7 @@ class ActionExecutor:
                 raise ActionNotFoundException(action_name)
 
             tracker_json = action_call["tracker"]
-            domain = action_call.get("domain", {})
+            domain = self.update_and_return_domain(action_call, action_name)
             tracker = Tracker.from_dict(tracker_json)
             dispatcher = CollectingDispatcher()
 
@@ -409,3 +519,13 @@ class ActionExecutor:
 
         logger.warning("Received an action call without an action.")
         return None
+
+    def list_actions(self) -> List[ActionName]:
+        """List all registered action names."""
+        return [ActionName(name=action_name) for action_name in self.actions.keys()]
+
+
+class ActionName(BaseModel):
+    """Model for action name."""
+
+    name: str = Field(alias="name")

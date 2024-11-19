@@ -5,7 +5,7 @@ from opentelemetry.sdk.trace import ReadableSpan, TracerProvider
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
 from rasa_sdk.tracing.instrumentation import instrumentation
-from tests.tracing.instrumentation.conftest import MockFormValidationAction
+from tests.conftest import MockFormValidationAction
 from rasa_sdk import Tracker
 from rasa_sdk.executor import CollectingDispatcher
 from rasa_sdk.events import ActionExecuted, SlotSet
@@ -43,9 +43,7 @@ async def test_form_validation_action_run(
 
     await mock_validation_action.run(dispatcher, tracker, {})
 
-    captured_spans: Sequence[
-        ReadableSpan
-    ] = span_exporter.get_finished_spans()  # type: ignore
+    captured_spans: Sequence[ReadableSpan] = span_exporter.get_finished_spans()  # type: ignore
 
     num_captured_spans = len(captured_spans) - previous_num_captured_spans
     # includes the child span for `_extract_validation_events` method call
@@ -106,9 +104,7 @@ async def test_form_validation_action_extract_validation_events(
         dispatcher, tracker, {}
     )
 
-    captured_spans: Sequence[
-        ReadableSpan
-    ] = span_exporter.get_finished_spans()  # type: ignore
+    captured_spans: Sequence[ReadableSpan] = span_exporter.get_finished_spans()  # type: ignore
 
     num_captured_spans = len(captured_spans) - previous_num_captured_spans
     assert num_captured_spans == 1

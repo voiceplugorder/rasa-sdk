@@ -1,10 +1,13 @@
 import json
+from functools import partial
+
 import pytest
 
 import rasa_sdk.endpoint as ep
 
 from typing import Sequence
 from opentelemetry.sdk.trace import TracerProvider
+from pytest import MonkeyPatch
 
 from opentelemetry.sdk.trace import ReadableSpan
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
@@ -35,18 +38,28 @@ def test_server_webhook_custom_action_is_instrumented(
     previous_num_captured_spans: int,
     action_name: str,
     action_package: str,
+    monkeypatch: MonkeyPatch,
 ) -> None:
     """Tests that the custom action is instrumented."""
-
+    monkeypatch.setattr(
+        "rasa_sdk.endpoint.get_tracer_provider", lambda _: tracer_provider
+    )
     data["next_action"] = action_name
-    app = ep.create_app(action_package, tracer_provider=tracer_provider)
+    data["domain"] = {}
+    action_executor = ep.ActionExecutor()
+    action_executor.register_package(action_package)
+    app = ep.create_app(action_executor)
+
+    app.register_listener(
+        partial(ep.load_tracer_provider, "endpoints.yml"),
+        "before_server_start",
+    )
+
     _, response = app.test_client.post("/webhook", data=json.dumps(data))
 
     assert response.status == 200
 
-    captured_spans: Sequence[
-        ReadableSpan
-    ] = span_exporter.get_finished_spans()  # type: ignore
+    captured_spans: Sequence[ReadableSpan] = span_exporter.get_finished_spans()  # type: ignore
 
     num_captured_spans = len(captured_spans) - previous_num_captured_spans
     assert num_captured_spans == 1
@@ -78,14 +91,14 @@ def test_server_webhook_custom_action_is_not_instrumented(
 ) -> None:
     """Tests that the server is not instrumented if no tracer provider is provided."""
     data["next_action"] = action_name
-    app = ep.create_app(action_package)
+    action_executor = ep.ActionExecutor()
+    action_executor.register_package(action_package)
+    app = ep.create_app(action_executor)
     _, response = app.test_client.post("/webhook", data=json.dumps(data))
 
     assert response.status == 200
 
-    captured_spans: Sequence[
-        ReadableSpan
-    ] = span_exporter.get_finished_spans()  # type: ignore
+    captured_spans: Sequence[ReadableSpan] = span_exporter.get_finished_spans()  # type: ignore
 
     num_captured_spans = len(captured_spans) - previous_num_captured_spans
     assert num_captured_spans == 0

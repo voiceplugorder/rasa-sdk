@@ -4,86 +4,109 @@ import logging
 import zlib
 
 import pytest
+from sanic import Sanic
 
 import rasa_sdk.endpoint as ep
 from rasa_sdk.events import SlotSet
 from tests.conftest import get_stack
 
-# noinspection PyTypeChecker
-app = ep.create_app(None)
-
 
 logger = logging.getLogger(__name__)
 
 
-def test_endpoint_exit_for_unknown_actions_package():
-    with pytest.raises(SystemExit):
-        ep.create_app("non-existing-actions-package")
+@pytest.fixture
+def action_executor() -> ep.ActionExecutor:
+    _executor = ep.ActionExecutor()
+    _executor.register_package("tests")
+    return _executor
 
 
-def test_server_health_returns_200():
-    request, response = app.test_client.get("/health")
+@pytest.fixture
+def sanic_app(action_executor: ep.ActionExecutor) -> Sanic:
+    return ep.create_app(action_executor)
+
+
+def test_server_health_returns_200(sanic_app: Sanic):
+    request, response = sanic_app.test_client.get("/health")
     assert response.status == 200
     assert response.json == {"status": "ok"}
 
 
-def test_server_list_actions_returns_200():
-    request, response = app.test_client.get("/actions")
-    assert response.status == 200
-    assert len(response.json) == 6
+def test_server_list_actions_returns_200(
+    sanic_app: Sanic,
+):
+    """Test that the server returns a list of actions."""
+    # When we request the list of actions
+    request, response = sanic_app.test_client.get("/actions")
 
-    # ENSURE TO UPDATE AS MORE ACTIONS ARE ADDED IN OTHER TESTS
+    # Then the server should return a list of actions
+    assert response.status == 200
+    assert len(response.json) == 9
+    print(response.json)
     expected = [
-        # defined in tests/test_actions.py
+        # defined in tests/conftest.py
         {"name": "custom_async_action"},
         {"name": "custom_action"},
         {"name": "custom_action_exception"},
         {"name": "custom_action_with_dialogue_stack"},
-        # defined in tests/tracing/instrumentation/conftest.py
+        {"name": "subclass_test_action_a"},
         {"name": "mock_validation_action"},
         {"name": "mock_form_validation_action"},
+        # defined in tests/test_forms.py
+        {"name": "some_form"},
+        # defined in tests/conftest.py
+        {"name": "subclass_test_action_b"},
     ]
     assert response.json == expected
 
 
-def test_server_webhook_unknown_action_returns_404():
+def test_server_webhook_unknown_action_returns_404(
+    sanic_app: Sanic,
+):
     data = {
-        "next_action": "test_action_1",
+        "next_action": "non_existing_action",
         "tracker": {"sender_id": "1", "conversation_id": "default"},
     }
-    request, response = app.test_client.post("/webhook", data=json.dumps(data))
+    request, response = sanic_app.test_client.post("/webhook", data=json.dumps(data))
     assert response.status == 404
 
 
-def test_server_webhook_handles_action_exception():
+def test_server_webhook_handles_action_exception(
+    sanic_app: Sanic,
+):
     data = {
         "next_action": "custom_action_exception",
         "tracker": {"sender_id": "1", "conversation_id": "default"},
+        "domain": {},
     }
-    request, response = app.test_client.post("/webhook", data=json.dumps(data))
+    request, response = sanic_app.test_client.post("/webhook", data=json.dumps(data))
     assert response.status == 500
     assert response.json.get("error") == "test exception"
     assert response.json.get("request_body") == data
 
 
-def test_server_webhook_custom_action_returns_200():
+def test_server_webhook_custom_action_returns_200(
+    sanic_app: Sanic,
+):
     data = {
         "next_action": "custom_action",
         "tracker": {"sender_id": "1", "conversation_id": "default"},
+        "domain": {},
     }
-    request, response = app.test_client.post("/webhook", data=json.dumps(data))
+    request, response = sanic_app.test_client.post("/webhook", data=json.dumps(data))
     events = response.json.get("events")
 
     assert events == [SlotSet("test", "bar")]
     assert response.status == 200
 
 
-def test_server_webhook_custom_async_action_returns_200():
+def test_server_webhook_custom_async_action_returns_200(sanic_app: Sanic):
     data = {
         "next_action": "custom_async_action",
         "tracker": {"sender_id": "1", "conversation_id": "default"},
+        "domain": {},
     }
-    request, response = app.test_client.post("/webhook", data=json.dumps(data))
+    request, response = sanic_app.test_client.post("/webhook", data=json.dumps(data))
     events = response.json.get("events")
 
     assert events == [SlotSet("test", "foo"), SlotSet("test2", "boo")]
@@ -109,14 +132,14 @@ def test_arg_parser_actions_params_module_style():
     assert cmdline_args.actions == "actions.act"
 
 
-def test_server_webhook_custom_action_encoded_data_returns_200():
+def test_server_webhook_custom_action_encoded_data_returns_200(sanic_app: Sanic):
     data = {
         "next_action": "custom_action",
         "tracker": {"sender_id": "1", "conversation_id": "default"},
         "domain": {"intents": ["greet", "goodbye"]},
     }
 
-    request, response = app.test_client.post(
+    request, response = sanic_app.test_client.post(
         "/webhook",
         data=zlib.compress(json.dumps(data).encode()),
         headers={"Content-encoding": "deflate"},
@@ -135,13 +158,16 @@ def test_server_webhook_custom_action_encoded_data_returns_200():
     ],
 )
 def test_server_webhook_custom_action_with_dialogue_stack_returns_200(
-    stack_state: Dict[Text, Any], dialogue_stack: List[Dict[Text, Any]]
+    stack_state: Dict[Text, Any],
+    dialogue_stack: List[Dict[Text, Any]],
+    sanic_app: Sanic,
 ):
     data = {
         "next_action": "custom_action_with_dialogue_stack",
         "tracker": {"sender_id": "1", "conversation_id": "default", **stack_state},
+        "domain": {},
     }
-    _, response = app.test_client.post("/webhook", data=json.dumps(data))
+    _, response = sanic_app.test_client.post("/webhook", data=json.dumps(data))
     events = response.json.get("events")
 
     assert events == [SlotSet("stack", dialogue_stack)]

@@ -1,14 +1,18 @@
 import argparse
 import logging
 import os
-import types
 import warnings
 import zlib
 import json
-from typing import List, Text, Union, Optional
+from functools import partial
+from typing import List, Text, Union, Optional, Any
 from ssl import SSLContext
+
+from multidict import MultiDict
 from sanic import Sanic, response
+from sanic.compat import Header
 from sanic.response import HTTPResponse
+from sanic.worker.loader import AppLoader
 
 # catching:
 # - all `pkg_resources` deprecation warning from multiple dependencies
@@ -24,16 +28,27 @@ with warnings.catch_warnings():
         category=DeprecationWarning,
         message="distutils Version classes are deprecated",
     )
-    from opentelemetry.sdk.trace import TracerProvider
     from sanic_cors import CORS
     from sanic.request import Request
     from rasa_sdk import utils
     from rasa_sdk.cli.arguments import add_endpoint_arguments
-    from rasa_sdk.constants import DEFAULT_KEEP_ALIVE_TIMEOUT, DEFAULT_SERVER_PORT
+    from rasa_sdk.constants import (
+        DEFAULT_ENDPOINTS_PATH,
+        DEFAULT_KEEP_ALIVE_TIMEOUT,
+        DEFAULT_SERVER_PORT,
+    )
     from rasa_sdk.executor import ActionExecutor
-    from rasa_sdk.interfaces import ActionExecutionRejection, ActionNotFoundException
+    from rasa_sdk.interfaces import (
+        ActionExecutionRejection,
+        ActionNotFoundException,
+        ActionMissingDomainException,
+    )
     from rasa_sdk.plugin import plugin_manager
-    from rasa_sdk.tracing.utils import get_tracer_and_context, set_span_attributes
+    from rasa_sdk.tracing.utils import (
+        get_tracer_and_context,
+        get_tracer_provider,
+        set_span_attributes,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +57,6 @@ def configure_cors(
     app: Sanic, cors_origins: Union[Text, List[Text], None] = ""
 ) -> None:
     """Configure CORS origins for the given app."""
-
     CORS(
         app, resources={r"/*": {"origins": cors_origins or ""}}, automatic_options=True
     )
@@ -54,7 +68,6 @@ def create_ssl_context(
     ssl_password: Optional[Text] = None,
 ) -> Optional[SSLContext]:
     """Create a SSL context if a certificate is passed."""
-
     if ssl_certificate:
         import ssl
 
@@ -69,7 +82,6 @@ def create_ssl_context(
 
 def create_argument_parser():
     """Parse all the command line arguments for the run script."""
-
     parser = argparse.ArgumentParser(description="starts the action endpoint")
     add_endpoint_arguments(parser)
     utils.add_logging_level_option_arguments(parser)
@@ -77,30 +89,35 @@ def create_argument_parser():
     return parser
 
 
+async def load_tracer_provider(endpoints: str, app: Sanic):
+    """Load the tracer provider into the Sanic app."""
+    tracer_provider = get_tracer_provider(endpoints)
+    app.ctx.tracer_provider = tracer_provider
+
+
 def create_app(
-    action_package_name: Union[Text, types.ModuleType],
+    action_executor: ActionExecutor,
     cors_origins: Union[Text, List[Text], None] = "*",
     auto_reload: bool = False,
-    tracer_provider: Optional[TracerProvider] = None,
 ) -> Sanic:
     """Create a Sanic application and return it.
 
     Args:
-        action_package_name: Name of the package or module to load actions
-            from.
+        action_executor: The action executor to use.
         cors_origins: CORS origins to allow.
         auto_reload: When `True`, auto-reloading of actions is enabled.
-        tracer_provider: Tracer provider to use for tracing.
 
     Returns:
         A new Sanic application ready to be run.
     """
     app = Sanic("rasa_sdk", configure_logging=False)
 
+    # Reset Sanic warnings filter that allows the triggering of Sanic warnings
+    warnings.filterwarnings("ignore", category=DeprecationWarning, module=r"sanic.*")
+
     configure_cors(app, cors_origins)
 
-    executor = ActionExecutor()
-    executor.register_package(action_package_name)
+    app.ctx.tracer_provider = None
 
     @app.get("/health")
     async def health(_) -> HTTPResponse:
@@ -111,7 +128,22 @@ def create_app(
     @app.post("/webhook")
     async def webhook(request: Request) -> HTTPResponse:
         """Webhook to retrieve action calls."""
-        tracer, context, span_name = get_tracer_and_context(tracer_provider, request)
+        span_name = "create_app.webhook"
+
+        def header_to_multi_dict(headers: Header) -> MultiDict:
+            return MultiDict(
+                [
+                    (key, value)
+                    for key, value in headers.items()
+                    if key.lower() not in ("content-length", "content-encoding")
+                ]
+            )
+
+        tracer, context = get_tracer_and_context(
+            span_name=span_name,
+            tracer_provider=request.app.ctx.tracer_provider,
+            tracing_carrier=header_to_multi_dict(request.headers),
+        )
 
         with tracer.start_as_current_span(span_name, context=context) as span:
             if request.headers.get("Content-Encoding") == "deflate":
@@ -128,9 +160,9 @@ def create_app(
             utils.check_version_compatibility(action_call.get("version"))
 
             if auto_reload:
-                executor.reload()
+                action_executor.reload()
             try:
-                result = await executor.run(action_call)
+                result = await action_executor.run(action_call)
             except ActionExecutionRejection as e:
                 logger.debug(e)
                 body = {"error": e.message, "action_name": e.action_name}
@@ -139,18 +171,33 @@ def create_app(
                 logger.error(e)
                 body = {"error": e.message, "action_name": e.action_name}
                 return response.json(body, status=404)
+            except ActionMissingDomainException as e:
+                logger.debug(e)
+                body = {"error": e.message, "action_name": e.action_name}
+                return response.json(body, status=449)
 
-            set_span_attributes(span, action_call)
+            set_http_span_attributes(
+                span,
+                action_call,
+                http_method="POST",
+                route="/webhook",
+            )
 
-            return response.json(result, status=200)
+            return response.json(
+                result.model_dump() if result else None,
+                status=200,
+            )
 
     @app.get("/actions")
     async def actions(_) -> HTTPResponse:
         """List all registered actions."""
         if auto_reload:
-            executor.reload()
+            action_executor.reload()
 
-        body = [{"name": k} for k in executor.actions.keys()]
+        body = [
+            action_name_item.model_dump()
+            for action_name_item in action_executor.list_actions()
+        ]
         return response.json(body, status=200)
 
     @app.exception(Exception)
@@ -166,34 +213,64 @@ def create_app(
 
 
 def run(
-    action_package_name: Union[Text, types.ModuleType],
+    action_executor: ActionExecutor,
     port: int = DEFAULT_SERVER_PORT,
     cors_origins: Union[Text, List[Text], None] = "*",
     ssl_certificate: Optional[Text] = None,
     ssl_keyfile: Optional[Text] = None,
     ssl_password: Optional[Text] = None,
     auto_reload: bool = False,
-    tracer_provider: Optional[TracerProvider] = None,
+    endpoints: str = DEFAULT_ENDPOINTS_PATH,
     keep_alive_timeout: int = DEFAULT_KEEP_ALIVE_TIMEOUT,
 ) -> None:
     """Starts the action endpoint server with given config values."""
     logger.info("Starting action endpoint server...")
-    app = create_app(
-        action_package_name,
-        cors_origins=cors_origins,
-        auto_reload=auto_reload,
-        tracer_provider=tracer_provider,
+    loader = AppLoader(
+        factory=partial(
+            create_app,
+            action_executor,
+            cors_origins=cors_origins,
+            auto_reload=auto_reload,
+        ),
     )
+    app = loader.load()
+
     app.config.KEEP_ALIVE_TIMEOUT = keep_alive_timeout
-    ## Attach additional sanic extensions: listeners, middleware and routing
+
+    app.register_listener(
+        partial(load_tracer_provider, endpoints),
+        "before_server_start",
+    )
+
+    # Attach additional sanic extensions: listeners, middleware and routing
     logger.info("Starting plugins...")
     plugin_manager().hook.attach_sanic_app_extensions(app=app)
+
     ssl_context = create_ssl_context(ssl_certificate, ssl_keyfile, ssl_password)
     protocol = "https" if ssl_context else "http"
     host = os.environ.get("SANIC_HOST", "0.0.0.0")
 
     logger.info(f"Action endpoint is up and running on {protocol}://{host}:{port}")
-    app.run(host, port, ssl=ssl_context, workers=utils.number_of_sanic_workers())
+    app.run(
+        host=host,
+        port=port,
+        ssl=ssl_context,
+        workers=utils.number_of_sanic_workers(),
+        legacy=True,
+    )
+
+
+def set_http_span_attributes(
+    span: Any,
+    action_call: dict,
+    http_method: str,
+    route: str,
+) -> None:
+    """Sets http span attributes."""
+    set_span_attributes(span, action_call)
+    if span.is_recording():
+        span.set_attribute("http.method", http_method)
+        span.set_attribute("http.route", route)
 
 
 if __name__ == "__main__":
