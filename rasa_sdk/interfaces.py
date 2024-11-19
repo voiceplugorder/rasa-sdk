@@ -113,6 +113,7 @@ class Tracker:
         entity_type: Text,
         entity_role: Optional[Text] = None,
         entity_group: Optional[Text] = None,
+        ignore_roles_and_groups: Optional[bool] = False
     ) -> Iterator[Text]:
         """Get entity values found for the passed entity type and optional role and
         group in latest message.
@@ -131,6 +132,14 @@ class Tracker:
         """
 
         entities = self.latest_message.get("entities", [])
+        
+        if ignore_roles_and_groups:
+            return (
+            x.get("value")
+            for x in entities
+            if x.get("entity") == entity_type
+        )
+    
         return (
             x.get("value")
             for x in entities
