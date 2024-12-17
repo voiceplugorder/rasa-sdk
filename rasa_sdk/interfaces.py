@@ -114,7 +114,8 @@ class Tracker:
         entity_type: Text,
         entity_role: Optional[Text] = None,
         entity_group: Optional[Text] = None,
-        ignore_roles_and_groups: Optional[bool] = False
+        ignore_roles: Optional[bool] = False,
+        ignore_groups: Optional[bool] = False
     ) -> Iterator[Text]:
         """Get entity values found for the passed entity type.
 
@@ -134,11 +135,25 @@ class Tracker:
         """
         entities = self.latest_message.get("entities", [])
         
-        if ignore_roles_and_groups:
+        if all([ignore_roles,ignore_groups]):
             return (
             x.get("value")
             for x in entities
             if x.get("entity") == entity_type
+        )
+        if ignore_roles:
+            return (
+            x.get("value")
+            for x in entities
+            if x.get("entity") == entity_type
+            and x.get("group") == entity_group
+        )
+        if ignore_groups:
+            return (
+            x.get("value")
+            for x in entities
+            if x.get("entity") == entity_type
+            and x.get("role") == entity_role
         )
         
         return (
